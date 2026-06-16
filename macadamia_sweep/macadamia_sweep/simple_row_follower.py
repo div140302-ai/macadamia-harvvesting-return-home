@@ -85,6 +85,12 @@ class SimpleRowFollower(Node):
         self.odom_y: Optional[float] = None
         self.odom_yaw: Optional[float] = None
 
+        # Return-home bookkeeping. These are saved at /sweep_start and used
+        # after the row/nut mission so the robot drives back to where it began.
+        self.home_x: Optional[float] = None
+        self.home_y: Optional[float] = None
+        self.home_yaw: Optional[float] = None
+
         self.started = False
         self.state = "WAITING"
         self.state_start_time = self.get_clock().now()
@@ -214,6 +220,31 @@ class SimpleRowFollower(Node):
 
         self.recovery_angular = 0.20
 
+        # -----------------------------
+        # RETURN_HOME
+        # -----------------------------
+        # After the row sweep / nut collection run is finished, the robot
+        # returns to the odometry position recorded at /sweep_start.
+        self.declare_parameter("return_home_enabled", True)
+        self.return_home_enabled = bool(
+            self.get_parameter("return_home_enabled").value
+        )
+        self.declare_parameter("return_goal_tolerance", 0.12)
+        self.return_goal_tolerance = float(
+            self.get_parameter("return_goal_tolerance").value
+        )
+        self.declare_parameter("return_yaw_tolerance_deg", 12.0)
+        self.return_yaw_tolerance = math.radians(
+            float(self.get_parameter("return_yaw_tolerance_deg").value)
+        )
+        self.declare_parameter("return_max_duration", 120.0)
+        self.return_max_duration = float(
+            self.get_parameter("return_max_duration").value
+        )
+        self.return_linear_speed = 0.07
+        self.return_max_angular = 0.35
+        self.return_heading_slowdown = math.radians(35.0)
+
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.publish_status("Simple row follower ready. Publish /sweep_start to begin.")
@@ -223,7 +254,8 @@ class SimpleRowFollower(Node):
             f"start_side={self.start_side}, "
             f"max_rows={self.max_rows or 'unlimited'}, "
             f"row_group_gap={self.row_group_gap:.2f}m, "
-            f"lidar_yaw_offset={math.degrees(self.lidar_yaw_offset):+.0f}deg"
+            f"lidar_yaw_offset={math.degrees(self.lidar_yaw_offset):+.0f}deg, "
+            f"return_home={self.return_home_enabled}"
         )
 
     # -----------------------------
@@ -266,6 +298,24 @@ class SimpleRowFollower(Node):
         self.arc_start_yaw = None
         self.arc_last_yaw = None
         self.arc_accumulated_yaw = 0.0
+
+        # Save the starting pose for RETURN_HOME. If odom is not ready yet,
+        # control_loop will lazily fill this before the robot has moved far.
+        if self.odom_x is not None and self.odom_y is not None:
+            self.home_x = self.odom_x
+            self.home_y = self.odom_y
+            self.home_yaw = self.odom_yaw
+            self.get_logger().info(
+                f"Home pose saved: x={self.home_x:+.2f}, y={self.home_y:+.2f}, "
+                f"yaw={math.degrees(self.home_yaw or 0.0):+.1f}deg"
+            )
+        else:
+            self.home_x = None
+            self.home_y = None
+            self.home_yaw = None
+            self.get_logger().warn(
+                "Odom not ready at sweep_start - home pose will be saved on first odom tick."
+            )
 
         # THE key change: snapshot the row direction NOW. The robot is
         # parallel to the row at this instant, so odom_yaw is the row's
@@ -864,6 +914,110 @@ class SimpleRowFollower(Node):
         self.set_state("FOLLOW_OUT", status)
 
     # -----------------------------
+    # RETURN_HOME
+    # -----------------------------
+
+    def finish_or_return_home(self, reason: str):
+        """Go to RETURN_HOME if enabled, otherwise finish immediately."""
+        self.stop_robot()
+        if self.return_home_enabled:
+            if self.home_x is None or self.home_y is None:
+                self.set_state(
+                    "DONE",
+                    reason + " Cannot return home because start odom was not saved."
+                )
+            else:
+                self.set_state(
+                    "RETURN_HOME",
+                    reason + f" Returning to start x={self.home_x:+.2f}, y={self.home_y:+.2f}."
+                )
+        else:
+            self.set_state("DONE", reason + " Mission complete.")
+
+    def return_home(self):
+        """Drive back to the odometry pose recorded at /sweep_start."""
+        if self.home_x is None or self.home_y is None:
+            self.set_state("DONE", "No home pose saved. Robot stopped.")
+            self.stop_robot()
+            return
+
+        if self.odom_x is None or self.odom_y is None or self.odom_yaw is None:
+            self.stop_robot()
+            self.publish_status("RETURN_HOME waiting for odometry")
+            return
+
+        front = self.get_front_distance()
+        if front < self.emergency_stop_distance:
+            self.stop_robot()
+            self.publish_status(
+                f"RETURN_HOME blocked: front obstacle {front:.2f}m. Robot stopped."
+            )
+            return
+
+        dx = self.home_x - self.odom_x
+        dy = self.home_y - self.odom_y
+        dist = math.hypot(dx, dy)
+
+        # First reach the saved x/y position.
+        if dist > self.return_goal_tolerance:
+            target_yaw = math.atan2(dy, dx)
+            heading_error = self.normalize_angle(target_yaw - self.odom_yaw)
+
+            # If facing far away from home, rotate first. Otherwise drive forward
+            # with proportional heading correction. This avoids driving a big arc.
+            if abs(heading_error) > self.return_heading_slowdown:
+                linear = 0.0
+                angular = math.copysign(
+                    self.return_max_angular,
+                    heading_error,
+                )
+                mode = "turning toward start"
+            else:
+                linear = min(self.return_linear_speed, max(0.03, 0.45 * dist))
+                angular = max(
+                    -self.return_max_angular,
+                    min(self.return_max_angular, 1.4 * heading_error),
+                )
+                mode = "driving to start"
+
+            self.publish_cmd(linear, angular)
+            self.publish_status(
+                f"RETURN_HOME {mode} | dist={dist:.2f}m "
+                f"| heading_err={math.degrees(heading_error):+.0f}deg "
+                f"| front={front:.2f}m"
+            )
+            if self.elapsed_in_state() > self.return_max_duration:
+                self.set_state(
+                    "DONE",
+                    f"RETURN_HOME timeout after {self.return_max_duration:.0f}s. Robot stopped."
+                )
+                self.stop_robot()
+            return
+
+        # At x/y start. Rotate back to the original start heading if known.
+        if self.home_yaw is not None:
+            yaw_error = self.normalize_angle(self.home_yaw - self.odom_yaw)
+            if abs(yaw_error) > self.return_yaw_tolerance:
+                angular = max(
+                    -self.return_max_angular,
+                    min(self.return_max_angular, 1.2 * yaw_error),
+                )
+                if abs(angular) < self.min_align_angular:
+                    angular = math.copysign(self.min_align_angular, yaw_error)
+                self.publish_cmd(0.0, angular)
+                self.publish_status(
+                    f"RETURN_HOME at start, aligning yaw | "
+                    f"yaw_err={math.degrees(yaw_error):+.0f}deg"
+                )
+                return
+
+        self.stop_robot()
+        self.set_state(
+            "DONE",
+            f"Returned to start. Final distance={dist:.2f}m. Mission complete."
+        )
+
+    # -----------------------------
     # State machine
     # -----------------------------
 
@@ -885,6 +1039,15 @@ class SimpleRowFollower(Node):
             self.get_logger().info(
                 f"Lazy anchor: outbound={math.degrees(self.outbound_yaw):+.1f}deg "
                 f"return_target={math.degrees(self.return_target_yaw):+.1f}deg"
+            )
+
+        if (self.home_x is None or self.home_y is None) and self.odom_x is not None and self.odom_y is not None:
+            self.home_x = self.odom_x
+            self.home_y = self.odom_y
+            self.home_yaw = self.odom_yaw
+            self.get_logger().info(
+                f"Lazy home saved: x={self.home_x:+.2f}, y={self.home_y:+.2f}, "
+                f"yaw={math.degrees(self.home_yaw or 0.0):+.1f}deg"
             )
 
         if self.state == "FOLLOW_OUT":
@@ -957,12 +1120,9 @@ class SimpleRowFollower(Node):
                         f"Clearing row start."
                     )
                 else:
-                    self.set_state(
-                        "DONE",
-                        f"Row {self.rows_completed} done, {done_reason}. "
-                        f"Mission complete."
+                    self.finish_or_return_home(
+                        f"Row {self.rows_completed} done, {done_reason}."
                     )
-                    self.stop_robot()
                 return
 
         elif self.state == "CLEAR_NEXT":
@@ -970,6 +1130,9 @@ class SimpleRowFollower(Node):
 
         elif self.state == "TURN_NEXT":
             self.turn_to_next_row()
+
+        elif self.state == "RETURN_HOME":
+            self.return_home()
 
         elif self.state == "DONE":
             self.stop_robot()
