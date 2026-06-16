@@ -79,6 +79,7 @@ class SimpleRowFollower(Node):
         self.create_subscription(Odometry, "/odometry/filtered", self.odom_callback, 20)
         self.create_subscription(Empty, "/sweep_start", self.start_callback, 10)
         self.create_subscription(Empty, "/sweep_stop", self.stop_callback, 10)
+        self.create_subscription(Empty, "/return_home", self.return_home_callback, 10)
 
         self.latest_scan: Optional[LaserScan] = None
         self.odom_x: Optional[float] = None
@@ -255,7 +256,7 @@ class SimpleRowFollower(Node):
             f"max_rows={self.max_rows or 'unlimited'}, "
             f"row_group_gap={self.row_group_gap:.2f}m, "
             f"lidar_yaw_offset={math.degrees(self.lidar_yaw_offset):+.0f}deg, "
-            f"return_home={self.return_home_enabled}"
+            f"return_home={self.return_home_enabled}, manual_topic=/return_home"
         )
 
     # -----------------------------
@@ -345,6 +346,33 @@ class SimpleRowFollower(Node):
         self.stop_robot()
         self.publish_status("Manual stop received")
         self.get_logger().warn("Sweep stop received")
+
+    def return_home_callback(self, _msg: Empty):
+        """Manual trigger: publish /return_home to abandon the current sweep and drive home."""
+        # If home was not saved at /sweep_start because odometry was late,
+        # try to save it now only if the robot has not started moving yet.
+        # Normally this will already be set by start_callback/control_loop.
+        if self.home_x is None or self.home_y is None:
+            self.get_logger().warn(
+                "return_home requested, but no home pose has been saved. "
+                "Publish /sweep_start first so the robot knows where home is."
+            )
+            self.publish_status("Cannot RETURN_HOME: no saved home pose. Publish /sweep_start first.")
+            return
+
+        self.started = True
+        self.next_row_hits = 0
+        self.clear_start_x = None
+        self.clear_start_y = None
+        self.arc_start_yaw = None
+        self.arc_last_yaw = None
+        self.arc_accumulated_yaw = 0.0
+        self.stop_robot()
+        self.set_state(
+            "RETURN_HOME",
+            f"Manual return-home requested. Returning to x={self.home_x:+.2f}, y={self.home_y:+.2f}."
+        )
+        self.get_logger().warn("Manual return-home requested")
 
     # -----------------------------
     # Helpers
